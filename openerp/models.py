@@ -238,8 +238,9 @@ class MetaModel(api.Meta):
 
         # transform columns into new-style fields (enables field inheritance)
         for name, column in self._columns.iteritems():
-            if not hasattr(self, name):
-                setattr(self, name, column.to_field())
+            if name in self.__dict__:
+                _logger.warning("Field %r erasing an existing value", name)
+            setattr(self, name, column.to_field())
 
 
 class NewId(object):
@@ -602,9 +603,6 @@ class BaseModel(object):
             )
             columns.update(cls._columns)
 
-            defaults = dict(parent_class._defaults)
-            defaults.update(cls._defaults)
-
             inherits = dict(parent_class._inherits)
             inherits.update(cls._inherits)
 
@@ -629,7 +627,6 @@ class BaseModel(object):
                 '_name': name,
                 '_register': False,
                 '_columns': columns,
-                '_defaults': defaults,
                 '_inherits': inherits,
                 '_depends': depends,
                 '_constraints': constraints,
@@ -643,7 +640,7 @@ class BaseModel(object):
             '_name': name,
             '_register': False,
             '_columns': dict(cls._columns),
-            '_defaults': dict(cls._defaults),
+            '_defaults': {},            # filled by Field._determine_default()
             '_inherits': dict(cls._inherits),
             '_depends': dict(cls._depends),
             '_constraints': list(cls._constraints),
@@ -814,7 +811,7 @@ class BaseModel(object):
         cls._fields = {}
         for attr, field in getmembers(cls, Field.__instancecheck__):
             if not field.inherited:
-                cls._add_field(attr, field.copy())
+                cls._add_field(attr, field.new())
 
         # introduce magic fields
         cls._add_magic_fields()
@@ -1369,15 +1366,7 @@ class BaseModel(object):
             self[name] = self.env['ir.property'].get(name, self._name)
             return
 
-        # 4. look up _defaults
-        if name in self._defaults:
-            value = self._defaults[name]
-            if callable(value):
-                value = value(self._model, cr, uid, context)
-            self[name] = value
-            return
-
-        # 5. delegate to field
+        # 4. delegate to field
         field.determine_default(self)
 
     def fields_get_keys(self, cr, user, context=None):
@@ -2413,22 +2402,13 @@ class BaseModel(object):
 
 
     def _set_default_value_on_column(self, cr, column_name, context=None):
-        # ideally should use add_default_value but fails
-        # due to ir.values not being ready
+        # ideally, we should use default_get(), but it fails due to ir.values
+        # not being ready
 
-        # get old-style default
+        # get default value
         default = self._defaults.get(column_name)
         if callable(default):
             default = default(self, cr, SUPERUSER_ID, context)
-
-        # get new_style default if no old-style
-        if default is None:
-            record = self.new(cr, SUPERUSER_ID, context=context)
-            field = self._fields[column_name]
-            field.determine_default(record)
-            defaults = dict(record._cache)
-            if column_name in defaults:
-                default = field.convert_to_write(defaults[column_name])
 
         column = self._columns[column_name]
         ss = column._symbol_set
@@ -2934,7 +2914,7 @@ class BaseModel(object):
         for parent_model, parent_field in reversed(cls._inherits.items()):
             for attr, field in cls.pool[parent_model]._fields.iteritems():
                 if attr not in cls._fields:
-                    cls._add_field(attr, field.copy(
+                    cls._add_field(attr, field.new(
                         inherited=True,
                         related=(parent_field, attr),
                         related_sudo=False,
@@ -3775,6 +3755,8 @@ class BaseModel(object):
             upd0.append('write_uid=%s')
             upd0.append("write_date=(now() at time zone 'UTC')")
             upd1.append(user)
+            direct.append('write_uid')
+            direct.append('write_date')
 
         if len(upd0):
             self.check_access_rule(cr, user, ids, 'write', context=context)
@@ -3796,6 +3778,11 @@ class BaseModel(object):
                             self.write(cr, user, ids, {f: vals[f]}, context=context_wo_lang)
                         self.pool.get('ir.translation')._set_ids(cr, user, self._name+','+f, 'model', context['lang'], ids, vals[f], src_trans)
 
+        # invalidate and mark new-style fields to recompute; do this before
+        # setting other fields, because it can require the value of computed
+        # fields, e.g., a one2many checking constraints on records
+        recs.modified(direct)
+
         # call the 'set' method of fields which are not classic_write
         upd_todo.sort(lambda x, y: self._columns[x].priority-self._columns[y].priority)
 
@@ -3808,6 +3795,9 @@ class BaseModel(object):
         for field in upd_todo:
             for id in ids:
                 result += self._columns[field].set(cr, self, id, field, vals[field], user, context=rel_context) or []
+
+        # for recomputing new-style fields
+        recs.modified(upd_todo)
 
         unknown_fields = updend[:]
         for table in self._inherits:
@@ -3891,9 +3881,6 @@ class BaseModel(object):
 
         result += self._store_get_values(cr, user, ids, vals.keys(), context)
         result.sort()
-
-        # for recomputing new-style fields
-        recs.modified(modified_fields)
 
         done = {}
         for order, model_name, ids_to_update, fields_to_recompute in result:
@@ -4104,7 +4091,6 @@ class BaseModel(object):
 
         id_new, = cr.fetchone()
         recs = self.browse(cr, user, id_new, context)
-        upd_todo.sort(lambda x, y: self._columns[x].priority-self._columns[y].priority)
 
         if self._parent_store and not context.get('defer_parent_store_computation'):
             if self.pool._init:
@@ -4131,6 +4117,14 @@ class BaseModel(object):
                 cr.execute('update '+self._table+' set parent_left=%s,parent_right=%s where id=%s', (pleft+1, pleft+2, id_new))
                 recs.invalidate_cache(['parent_left', 'parent_right'])
 
+        # invalidate and mark new-style fields to recompute; do this before
+        # setting other fields, because it can require the value of computed
+        # fields, e.g., a one2many checking constraints on records
+        recs.modified([u[0] for u in updates])
+
+        # call the 'set' method of fields which are not classic_write
+        upd_todo.sort(lambda x, y: self._columns[x].priority-self._columns[y].priority)
+
         # default element in context must be remove when call a one2many or many2many
         rel_context = context.copy()
         for c in context.items():
@@ -4141,14 +4135,11 @@ class BaseModel(object):
         for field in upd_todo:
             result += self._columns[field].set(cr, self, id_new, field, vals[field], user, rel_context) or []
 
+        # for recomputing new-style fields
+        recs.modified(upd_todo)
+
         # check Python constraints
         recs._validate_fields(vals)
-
-        # invalidate and mark new-style fields to recompute
-        modified_fields = list(vals)
-        if self._log_access:
-            modified_fields += ['create_uid', 'create_date', 'write_uid', 'write_date']
-        recs.modified(modified_fields)
 
         if context.get('recompute', True):
             result += self._store_get_values(cr, user, [id_new],

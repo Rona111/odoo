@@ -25,6 +25,7 @@ from copy import copy
 from datetime import date, datetime
 from functools import partial
 from operator import attrgetter
+from types import NoneType
 import logging
 import pytz
 import xmlrpclib
@@ -263,7 +264,7 @@ class Field(object):
     store = True                # whether the field is stored in database
     index = False               # whether the field is indexed in database
     manual = False              # whether the field is a custom field
-    copyable = True             # whether the field is copied over by BaseModel.copy()
+    copy = True                 # whether the field is copied over by BaseModel.copy()
     depends = ()                # collection of field dependencies
     recursive = False           # whether self depends on itself
     compute = None              # compute(recs) computes field on recs
@@ -272,7 +273,7 @@ class Field(object):
     related = None              # sequence of field names, for related fields
     related_sudo = True         # whether related fields should be read as admin
     company_dependent = False   # whether `self` is company-dependent (property field)
-    default = None              # default value (literal or callable)
+    default = None              # default(recs) returns the default value
 
     string = None               # field label
     help = None                 # field tooltip
@@ -288,14 +289,9 @@ class Field(object):
         self._attrs = {key: val for key, val in kwargs.iteritems() if val is not None}
         self._free_attrs = []
 
-    def copy(self, **kwargs):
-        """ copy(item) -> test
-
-        make a copy of `self`, possibly modified with parameters `kwargs` """
-        field = copy(self)
-        field._attrs = {key: val for key, val in kwargs.iteritems() if val is not None}
-        field._free_attrs = list(self._free_attrs)
-        return field
+    def new(self, **kwargs):
+        """ Return a field of the same type as `self`, with its own parameters. """
+        return type(self)(**kwargs)
 
     def set_class_name(self, cls, name):
         """ Assign the model class and field name of `self`. """
@@ -320,9 +316,6 @@ class Field(object):
         if attrs.get('related'):
             # by default, related fields are not stored
             attrs['store'] = attrs.get('store', False)
-        if 'copy' in attrs:
-            # attribute is copyable because there is also a copy() method
-            attrs['copyable'] = attrs.pop('copy')
 
         for attr, value in attrs.iteritems():
             if not hasattr(self, attr):
@@ -332,7 +325,47 @@ class Field(object):
         if not self.string:
             self.string = name.replace('_', ' ').capitalize()
 
+        # determine self.default and cls._defaults in a consistent way
+        self._determine_default(cls, name)
+
         self.reset()
+
+    def _determine_default(self, cls, name):
+        """ Retrieve the default value for `self` in the hierarchy of `cls`, and
+            determine `self.default` and `cls._defaults` accordingly.
+        """
+        self.default = None
+
+        # traverse the class hierarchy upwards, and take the first field
+        # definition with a default or _defaults for self
+        for klass in cls.__mro__:
+            field = klass.__dict__.get(name, self)
+            if not isinstance(field, type(self)):
+                return      # klass contains another value overridden by self
+
+            if 'default' in field._attrs:
+                # take the default in field, and adapt it for cls._defaults
+                value = field._attrs['default']
+                if callable(value):
+                    self.default = value
+                    cls._defaults[name] = lambda model, cr, uid, context: \
+                        self.convert_to_write(value(model.browse(cr, uid, [], context)))
+                else:
+                    self.default = lambda recs: value
+                    cls._defaults[name] = value
+                return
+
+            defaults = klass.__dict__.get('_defaults') or {}
+            if name in defaults:
+                # take the value from _defaults, and adapt it for self.default
+                value = defaults[name]
+                value_func = value if callable(value) else lambda *args: value
+                self.default = lambda recs: self.convert_to_cache(
+                    value_func(recs._model, recs._cr, recs._uid, recs._context),
+                    recs, validate=False,
+                )
+                cls._defaults[name] = value
+                return
 
     def __str__(self):
         return "%s.%s" % (self.model_name, self.name)
@@ -393,12 +426,17 @@ class Field(object):
         if isinstance(self.related, basestring):
             self.related = tuple(self.related.split('.'))
 
-        # determine the related field, and make sure it is set up
+        # determine the chain of fields, and make sure they are all set up
+        fields = []
         recs = env[self.model_name]
-        for name in self.related[:-1]:
+        for name in self.related:
+            fields.append(recs._fields[name])
             recs = recs[name]
-        field = self.related_field = recs._fields[self.related[-1]]
-        field.setup(env)
+
+        for field in fields:
+            field.setup(env)
+
+        self.related_field = field = fields[-1]
 
         # check type consistency
         if self.type != field.type:
@@ -445,6 +483,7 @@ class Field(object):
         return [('.'.join(self.related), operator, value)]
 
     # properties used by _setup_related() to copy values from related field
+    _related_comodel_name = property(attrgetter('comodel_name'))
     _related_string = property(attrgetter('string'))
     _related_help = property(attrgetter('help'))
     _related_readonly = property(attrgetter('readonly'))
@@ -616,7 +655,7 @@ class Field(object):
         return getattr(fields, self.type)(**args)
 
     # properties used by to_column() to create a column instance
-    _column_copy = property(attrgetter('copyable'))
+    _column_copy = property(attrgetter('copy'))
     _column_select = property(attrgetter('index'))
     _column_manual = property(attrgetter('manual'))
     _column_string = property(attrgetter('string'))
@@ -824,8 +863,8 @@ class Field(object):
 
     def determine_default(self, record):
         """ determine the default value of field `self` on `record` """
-        if self.default is not None:
-            value = self.default(record) if callable(self.default) else self.default
+        if self.default:
+            value = self.default(record)
             record._cache[self] = self.convert_to_cache(value, record)
         elif self.compute:
             self._compute_value(record)
@@ -943,6 +982,9 @@ class Float(Field):
     def _setup_digits(self, env):
         """ Setup the digits for `self` and its corresponding column """
         self.digits = self._digits(env.cr) if callable(self._digits) else self._digits
+        if self.digits:
+            assert isinstance(self.digits, (tuple, list)) and len(self.digits) >= 2, \
+                "Float field %s with digits %r, expecting (total, decimal)" % (self, self.digits)
         if self.store:
             column = env[self.model_name]._columns[self.name]
             column.digits_change(env.cr)
@@ -984,6 +1026,11 @@ class Char(_String):
     """
     type = 'char'
     size = None
+
+    def _setup(self, env):
+        super(Char, self)._setup(env)
+        assert isinstance(self.size, (NoneType, int)), \
+            "Char field %s with non-integer size %r" % (self, self.size)
 
     _column_size = property(attrgetter('size'))
     _related_size = property(attrgetter('size'))
@@ -1263,6 +1310,11 @@ class Reference(Selection):
     def __init__(self, selection=None, string=None, **kwargs):
         super(Reference, self).__init__(selection=selection, string=string, **kwargs)
 
+    def _setup(self, env):
+        super(Reference, self)._setup(env)
+        assert isinstance(self.size, int), \
+            "Reference field %s with non-integer size %r" % (self, self.size)
+
     _related_size = property(attrgetter('size'))
 
     _column_size = property(attrgetter('size'))
@@ -1294,6 +1346,22 @@ class _Relational(Field):
     relational = True
     domain = None                       # domain for searching values
     context = None                      # context for searching values
+
+    def _setup(self, env):
+        super(_Relational, self)._setup(env)
+        assert self.comodel_name in env.registry, \
+            "Field %s with unknown comodel_name %r" % (self, self.comodel_name)
+
+    @property
+    def _related_domain(self):
+        if callable(self.domain):
+            # will be called with another model than self's
+            return lambda recs: self.domain(recs.env[self.model_name])
+        else:
+            # maybe not correct if domain is a string...
+            return self.domain
+
+    _related_context = property(attrgetter('context'))
 
     _description_relation = property(attrgetter('comodel_name'))
     _description_context = property(attrgetter('context'))
@@ -1555,7 +1623,7 @@ class One2many(_RelationalMulti):
     inverse_name = None                 # name of the inverse field
     auto_join = False                   # whether joins are generated upon search
     limit = None                        # optional limit to use upon read
-    copyable = False                    # o2m are not copied by default
+    copy = False                        # o2m are not copied by default
 
     def __init__(self, comodel_name=None, inverse_name=None, string=None, **kwargs):
         super(One2many, self).__init__(
