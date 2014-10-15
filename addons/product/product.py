@@ -584,7 +584,13 @@ class product_template(osv.osv):
         res = {}
         product_uom_obj = self.pool.get('product.uom')
         for product in products:
-            res[product.id] = product[ptype] or 0.0
+            # standard_price field can only be seen by users in base.group_user
+            # Thus, in order to compute the sale price from the cost price for users not in this group
+            # We fetch the standard price as the superuser
+            if ptype != 'standard_price':
+                res[product.id] = product[ptype] or 0.0
+            else:
+                res[product.id] = product.sudo()[ptype]
             if ptype == 'list_price':
                 res[product.id] += product._name == "product.product" and product.price_extra or 0.0
             if 'uom' in context:
@@ -1012,7 +1018,7 @@ class product_product(osv.osv):
             name = variant and "%s (%s)" % (product.name, variant) or product.name
             sellers = []
             if partner_ids:
-                partner_ids and filter(lambda x: x.name.id in partner_ids, product.seller_ids)
+                sellers = filter(lambda x: x.name.id in partner_ids, product.seller_ids)
             if sellers:
                 for s in sellers:
                     seller_variant = s.product_name and "%s (%s)" % (s.product_name, variant) or False
