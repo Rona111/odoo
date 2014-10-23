@@ -629,8 +629,7 @@ class Field(object):
         """ return a low-level field object corresponding to `self` """
         assert self.store
 
-        # some columns are registry-dependent, like float fields (digits);
-        # duplicate them to avoid sharing between registries
+        # determine column parameters
         _logger.debug("Create fields._column for Field %s", self)
         args = {}
         for attr, prop in self.column_attrs:
@@ -644,10 +643,9 @@ class Field(object):
             args['relation'] = self.comodel_name
             return fields.property(**args)
 
-        if isinstance(self.column, fields.function):
-            # it is too tricky to recreate a function field, so for that case,
-            # we make a stupid (and possibly incorrect) copy of the column
-            return copy(self.column)
+        if self.column:
+            # let the column provide a valid column for the given parameters
+            return self.column.new(**args)
 
         return getattr(fields, self.type)(**args)
 
@@ -1261,7 +1259,7 @@ class Selection(Field):
             name = "%s,%s" % (self.model_name, self.name)
             translate = partial(
                 env['ir.translation']._get_source, name, 'selection', env.lang)
-            return [(value, translate(label)) for value, label in selection]
+            return [(value, translate(label) if label else label) for value, label in selection]
         else:
             return selection
 
@@ -1303,14 +1301,14 @@ class Selection(Field):
 
 class Reference(Selection):
     type = 'reference'
-    size = 128
+    size = None
 
     def __init__(self, selection=None, string=None, **kwargs):
         super(Reference, self).__init__(selection=selection, string=string, **kwargs)
 
     def _setup(self, env):
         super(Reference, self)._setup(env)
-        assert isinstance(self.size, int), \
+        assert isinstance(self.size, (NoneType, int)), \
             "Reference field %s with non-integer size %r" % (self, self.size)
 
     _related_size = property(attrgetter('size'))
@@ -1725,10 +1723,6 @@ class Id(Field):
         super(Id, self).__init__(type='integer', string=string, **kwargs)
 
     def to_column(self):
-        """ to_column() -> fields._column
-
-        Whatever
-        """
         return fields.integer('ID')
 
     def __get__(self, record, owner):
