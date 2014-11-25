@@ -2362,6 +2362,14 @@ instance.web.search.AutoComplete = instance.web.Widget.extend({
                 ev.preventDefault();
                 return;
             }
+            // ENTER is caugth at KeyUp rather than KeyDown to avoid firing
+            // before all regular keystrokes have been processed
+            if (ev.which === $.ui.keyCode.ENTER) {
+                if (self.current_result && self.get_search_string().length) {
+                    self.select_item(ev);
+                }
+                return;
+            }
             if (!self.searching) {
                 self.searching = true;
                 return;
@@ -2376,8 +2384,10 @@ instance.web.search.AutoComplete = instance.web.Widget.extend({
         });
         this.$input.on('keydown', function (ev) {
             switch (ev.which) {
+                // TAB and direction keys are handled at KeyDown because KeyUp
+                // is not guaranteed to fire.
+                // See e.g. https://github.com/aef-/jquery.masterblaster/issues/13
                 case $.ui.keyCode.TAB:
-                case $.ui.keyCode.ENTER:
                     if (self.current_result && self.get_search_string().length) {
                         self.select_item(ev);
                     }
