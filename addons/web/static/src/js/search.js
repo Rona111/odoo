@@ -598,6 +598,7 @@ instance.web.SearchView = instance.web.Widget.extend(/** @lends instance.web.Sea
     search_view_loaded: function(data) {
         var self = this;
         this.fields_view = data;
+        this.view_id = this.view_id || data.view_id;
         if (data.type !== 'search' ||
             data.arch.tag !== 'search') {
                 throw new Error(_.str.sprintf(
@@ -1698,7 +1699,10 @@ instance.web.search.ManyToOneField = instance.web.search.CharField.extend({
         var values = facet.values;
         if (_.isEmpty(this.attrs.context) && values.length === 1) {
             var c = {};
-            c['default_' + this.attrs.name] = values.at(0).get('value');
+            var v = values.at(0);
+            if (v.get('operator') !== 'ilike') {
+                c['default_' + this.attrs.name] = v.get('value');
+            }
             return c;
         }
         return this._super(facet);
